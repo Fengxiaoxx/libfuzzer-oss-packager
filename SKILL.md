@@ -52,7 +52,19 @@ Confirm each file defines `LLVMFuzzerTestOneInput`.
 grep -l "LLVMFuzzerTestOneInput" <candidate_files>
 ```
 
-### 1b. Identify the build system
+### 1b. Check for `build_harness/` and identify the build system
+
+If the project was prepared with the pipeline skill, a `build_harness/` directory
+exists at the project root. Check it first — it contains the baseline (non-sanitized)
+build and its cmake/make invocation is the exact template to replicate with sanitizer
+flags:
+
+```bash
+ls build_harness/          # lib<name>.a, lib<name>.so, CMakeCache.txt, etc.
+cat build_harness/cmake.log 2>/dev/null | head -30   # see the cmake invocation used
+```
+
+Whether or not `build_harness/` exists, confirm the build system:
 
 | Evidence | Build system |
 |---|---|
