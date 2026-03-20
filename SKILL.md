@@ -54,15 +54,20 @@ grep -l "LLVMFuzzerTestOneInput" <candidate_files>
 
 ### 1b. Check for `build_harness/` and identify the build system
 
-If the project was prepared with the pipeline skill, a `build_harness/` directory
-exists at the project root. Check it first — it contains the baseline (non-sanitized)
-build and its cmake/make invocation is the exact template to replicate with sanitizer
-flags:
+If the project was prepared with `libfuzzer-lib-builder`, a `build_harness/`
+directory exists at the project root with pre-built instrumented archives under
+`asan/` and `msan/` subdirectories. You can reuse these directly instead of
+rebuilding — the cmake invocation is recorded inside the subdirectory:
 
 ```bash
-ls build_harness/          # lib<name>.a, lib<name>.so, CMakeCache.txt, etc.
-cat build_harness/cmake.log 2>/dev/null | head -30   # see the cmake invocation used
+ls build_harness/           # asan/  msan/  build_<libname>.sh
+ls build_harness/asan/      # lib<name>.a  include/  cmake_build/
+# The build script documents the cmake flags used:
+head -60 build_harness/build_<libname>.sh
 ```
+
+If `build_harness/` is absent, the packager must build the library itself
+(see the build commands in Step 2).
 
 Whether or not `build_harness/` exists, confirm the build system:
 
@@ -155,15 +160,25 @@ build_for_sanitizer() {
         CFLAGS="-O1 -fno-omit-frame-pointer -gline-tables-only \
             -DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION \
             -fsanitize=address -fsanitize-address-use-after-scope"
+        MSAN_CMAKE_FLAGS=""
     else
+        # MSan requires ALL inline ASM to be disabled — MSan cannot instrument
+        # hand-written assembly that writes to memory, causing false positives.
+        # Set MSAN_CMAKE_FLAGS to the library-specific ASM-disable option, e.g.:
+        #   libaom:        -DAOM_TARGET_CPU=generic
+        #   libjpeg-turbo: -DWITH_SIMD=0
+        #   libwebp:       -DWEBP_ENABLE_SIMD=0
+        # See libfuzzer-lib-builder references/build_systems.md for the full table.
         CFLAGS="-O1 -fno-omit-frame-pointer -gline-tables-only \
             -DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION \
             -fsanitize=memory -fsanitize-memory-track-origins"
+        MSAN_CMAKE_FLAGS="__REPLACE_WITH_ASM_DISABLE_FLAG__"
     fi
     LIB_FUZZING_ENGINE="-fsanitize=fuzzer"
 
     echo "=== Building library with -fsanitize=$SANITIZER ==="
     __BUILD_LIBRARY_COMMANDS__     # ← replace with actual build commands (see below)
+    # For CMake: append $MSAN_CMAKE_FLAGS to the cmake invocation when SANITIZER=memory
 
     echo "=== Compiling harnesses ==="
     for FUZZER in "${FUZZERS[@]}"; do
@@ -213,19 +228,37 @@ echo "All packages:"
 ls -lh "$FINAL_OUT"/*.zip
 ```
 
+### Reusing pre-built archives from `libfuzzer-lib-builder`
+
+If `build_harness/asan/` and `build_harness/msan/` already exist, skip the library
+rebuild inside `build_for_sanitizer` and link directly against the pre-built archive.
+Replace `__BUILD_LIBRARY_COMMANDS__` and `__LINK_FLAGS__` with:
+
+```bash
+# Reuse pre-built archives — no rebuild needed
+if [ "$SANITIZER" = "address" ]; then
+    PREBUILT="$PROJECT_ROOT/build_harness/asan"
+else
+    PREBUILT="$PROJECT_ROOT/build_harness/msan"
+fi
+# Then in the harness compile loop, add -I"$PREBUILT/include" and link "$PREBUILT/lib<name>.a"
+```
+
 ### Build library commands per build system
 
-Fill in `__BUILD_LIBRARY_COMMANDS__` based on the build system found in Step 1:
+Fill in `__BUILD_LIBRARY_COMMANDS__` based on the build system found in Step 1
+(only needed when `build_harness/` was NOT created by `libfuzzer-lib-builder`):
 
 **CMake:**
 ```bash
 cd "$LIB_BUILD"
 cmake "$SRC" \
     -DBUILD_SHARED_LIBS=OFF \
-    -DENABLE_CJSON_TEST=OFF \       # disable tests to avoid linking issues
+    -DENABLE_TESTING=OFF \          # disable tests to avoid linking issues (flag varies per library)
     -DCMAKE_C_COMPILER=$CC \
     -DCMAKE_C_FLAGS="$CFLAGS" \
     -DCMAKE_BUILD_TYPE=Release \
+    ${MSAN_CMAKE_FLAGS:+$MSAN_CMAKE_FLAGS} \   # MSan only: disables inline ASM
     -Wno-dev > cmake.log 2>&1
 make -j$(nproc) >> cmake.log 2>&1
 # Static lib is usually at: $LIB_BUILD/lib<name>.a
@@ -312,7 +345,8 @@ rm -rf build_tmp/ build_and_package.sh
 |---|---|---|
 | `undefined reference to LLVMFuzzerTestOneInput` | Compiled `.c` with `clang++` | Use `clang` for C harnesses |
 | `cannot find -lasan` / `-lmsan` | clang not installed or wrong version | Install `clang` / `llvm` via apt |
-| MSAN: false positives from uninstrumented libc | libc not MSAN-instrumented | Expected outside OSS-Fuzz Docker; binaries still usable for coverage |
+| MSan build fails or produces many false positives from libaom / libjpeg etc. | Inline ASM not disabled for MSan | Set `MSAN_CMAKE_FLAGS` to the library's ASM-disable option (e.g., `-DAOM_TARGET_CPU=generic`, `-DWITH_SIMD=0`) — see `libfuzzer-lib-builder` references/build_systems.md |
+| MSAN: false positives from uninstrumented libc | libc not MSAN-instrumented | Expected outside OSS-Fuzz Docker; real bugs show user-code frames in the origin stack |
 | Shared lib linked instead of static | `-DBUILD_SHARED_LIBS` not set to OFF | Add `-DBUILD_SHARED_LIBS=OFF` to cmake |
 | Empty seed zip | Wrong seed directory path | Re-run Step 1c to verify paths |
 | `llvm-symbolizer: not found` | llvm not installed | `apt install llvm` |
