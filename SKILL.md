@@ -40,17 +40,26 @@ Before writing any build script, collect these facts about the project:
 
 ### 1a. Find harness source files
 
+Search the **entire project tree** — harnesses may live in multiple directories
+(e.g., `fuzzing/`, `tests/fuzz/`, `fuzz/`, or directly in the source root).
+Collect every file, regardless of location:
+
 ```bash
-find <project_dir> -name "*fuzzer*.c" -o -name "*fuzzer*.cpp" \
-                   -o -name "*fuzz*.c"  -o -name "*fuzz*.cpp" | sort
+find <project_dir> \( -name "*fuzzer*.c" -o -name "*fuzzer*.cpp" \
+                      -o -name "*fuzz*.c"  -o -name "*fuzz*.cpp" \) | sort
 ```
 
 Filter out `fuzz_main.c` / `afl.c` — those are driver stubs, not harnesses.
-Confirm each file defines `LLVMFuzzerTestOneInput`.
+Confirm each file defines `LLVMFuzzerTestOneInput`:
 
 ```bash
-grep -l "LLVMFuzzerTestOneInput" <candidate_files>
+grep -rl "LLVMFuzzerTestOneInput" <project_dir> \
+    --include="*.c" --include="*.cpp" | grep -v -E "(fuzz_main|afl)\."
 ```
+
+Record the **absolute path** and **file extension** (`c` or `cpp`) of every
+harness — the build script will use these directly (no single `FUZZING_DIR`
+assumption).
 
 ### 1b. Check for `build_harness/` and identify the build system
 
@@ -80,17 +89,21 @@ Whether or not `build_harness/` exists, confirm the build system:
 
 ### 1c. Find seed directories
 
-Common conventions (check all of them):
+The build script will auto-match seeds per fuzzer (see Step 2). During discovery,
+just confirm which patterns actually exist in the project:
 
 | Pattern | Example |
 |---|---|
 | `seeds_<fuzzer_name>/` | `seeds_cjson_read_fuzzer/` |
+| `<fuzzer_name>_corpus/` | per-fuzzer corpus |
 | `inputs/` | shared corpus for all fuzzers |
 | `corpus/` | shared corpus |
-| `<fuzzer_name>_corpus/` | per-fuzzer corpus |
+| `fuzzing/seeds_<fuzzer_name>/` | seeds inside the fuzzing subdirectory |
+| `fuzzing/inputs/` | shared seeds inside the fuzzing subdirectory |
 
-Map each harness → its seed directory. A harness with no seeds simply gets no
-`_seed_corpus.zip` (OSS-Fuzz accepts this, but warn the user).
+The build script probes all patterns in priority order (per-fuzzer first, shared
+fallback). A harness with no seeds gets no `_seed_corpus.zip` (OSS-Fuzz accepts
+this, but warn the user).
 
 ### 1d. Find dictionary files
 
@@ -117,43 +130,77 @@ Use the template below and fill in the library-specific parts.
 # ──────────────────────────────────────────────
 # CONFIGURATION — fill these in per-library
 # ──────────────────────────────────────────────
-LIB_NAME="<libname>"                          # e.g. cjson
-SRC="<absolute_path_to_library_source>"       # directory with CMakeLists.txt / Makefile
-FUZZING_DIR="<absolute_path_to_fuzzing_dir>"  # directory containing harness .c/.cpp files
-FINAL_OUT="<absolute_output_dir>"             # where to write the final zips
+LIB_NAME="<libname>"                    # e.g. cjson
+PROJECT_ROOT="<absolute_project_root>"  # root of the target library (contains CMakeLists.txt etc.)
+FINAL_OUT="<absolute_output_dir>"       # where to write the final zips
 
 CC=clang
 CXX=clang++
 
-# All harness base names (no extension, no path)
-FUZZERS=(
-    fuzzer_one
-    fuzzer_two
-    # add more
-)
-
-# Seed dir for each fuzzer (associative array)
-declare -A SEED_DIRS
-SEED_DIRS[fuzzer_one]="$FUZZING_DIR/seeds_fuzzer_one"
-SEED_DIRS[fuzzer_two]="$FUZZING_DIR/inputs"
-# SEED_DIRS[fuzzer_three]=""   ← leave empty string if no seeds exist
-
 # Path to the shared dict file, or "" if none
-DICT_FILE="$FUZZING_DIR/library.dict"
+DICT_FILE=""   # e.g. "$PROJECT_ROOT/fuzzing/json.dict"
 
-# File extension of harness sources ("c" or "cpp")
-HARNESS_EXT="c"
+# ──────────────────────────────────────────────
+# AUTO-DISCOVER all harnesses across the project
+# ──────────────────────────────────────────────
+# Maps: fuzzer_name → absolute source path, and fuzzer_name → extension
+declare -A FUZZER_SRCS
+declare -A FUZZER_EXTS
+
+while IFS= read -r HARNESS_FILE; do
+    BASENAME=$(basename "$HARNESS_FILE")
+    FNAME="${BASENAME%.*}"
+    EXT="${BASENAME##*.}"
+    FUZZER_SRCS["$FNAME"]="$HARNESS_FILE"
+    FUZZER_EXTS["$FNAME"]="$EXT"
+done < <(find "$PROJECT_ROOT" \
+    \( -name "*fuzzer*.c"   -o -name "*fuzzer*.cpp" \
+       -o -name "*fuzz*.c"  -o -name "*fuzz*.cpp" \) \
+    | grep -v -E "(fuzz_main|afl)\." \
+    | sort)
+
+if [ ${#FUZZER_SRCS[@]} -eq 0 ]; then
+    echo "ERROR: No harness files found under $PROJECT_ROOT" >&2
+    exit 1
+fi
+
+echo "Discovered ${#FUZZER_SRCS[@]} harness(es):"
+for F in "${!FUZZER_SRCS[@]}"; do echo "  $F  (${FUZZER_EXTS[$F]})  ${FUZZER_SRCS[$F]}"; done
+
+# ──────────────────────────────────────────────
+# AUTO-DISCOVER seed directories per fuzzer
+# Priority: per-fuzzer dirs first, then shared fallbacks
+# ──────────────────────────────────────────────
+declare -A SEED_DIRS
+
+for FUZZER in "${!FUZZER_SRCS[@]}"; do
+    SEED_DIRS["$FUZZER"]=""
+    for CANDIDATE in \
+        "$PROJECT_ROOT/seeds_${FUZZER}" \
+        "$PROJECT_ROOT/fuzzing/seeds_${FUZZER}" \
+        "$PROJECT_ROOT/${FUZZER}_corpus" \
+        "$PROJECT_ROOT/fuzzing/${FUZZER}_corpus" \
+        "$PROJECT_ROOT/inputs" \
+        "$PROJECT_ROOT/corpus" \
+        "$PROJECT_ROOT/fuzzing/inputs" \
+        "$PROJECT_ROOT/fuzzing/corpus"; do
+        if [ -d "$CANDIDATE" ] && [ -n "$(ls -A "$CANDIDATE" 2>/dev/null)" ]; then
+            SEED_DIRS["$FUZZER"]="$CANDIDATE"
+            break
+        fi
+    done
+done
 
 # ──────────────────────────────────────────────
 # BUILD FUNCTION — called once per sanitizer
 # ──────────────────────────────────────────────
 build_for_sanitizer() {
     local SANITIZER=$1          # "address" or "memory"
-    local OUT_DIR="$(mktemp -d)/build_${SANITIZER}"
-    local LIB_BUILD="$(mktemp -d)/lib_${SANITIZER}"
+    local LIB_BUILD
+    LIB_BUILD="$(mktemp -d)/lib_${SANITIZER}"
     local PKG_DIR="$FINAL_OUT/pkg_${SANITIZER}"
 
-    mkdir -p "$OUT_DIR" "$LIB_BUILD" "$PKG_DIR"
+    mkdir -p "$LIB_BUILD" "$PKG_DIR"
 
     # Sanitizer flags
     if [ "$SANITIZER" = "address" ]; then
@@ -180,25 +227,26 @@ build_for_sanitizer() {
     __BUILD_LIBRARY_COMMANDS__     # ← replace with actual build commands (see below)
     # For CMake: append $MSAN_CMAKE_FLAGS to the cmake invocation when SANITIZER=memory
 
-    echo "=== Compiling harnesses ==="
-    for FUZZER in "${FUZZERS[@]}"; do
+    echo "=== Compiling all harnesses ==="
+    for FUZZER in "${!FUZZER_SRCS[@]}"; do
+        EXT="${FUZZER_EXTS[$FUZZER]}"
         COMPILER=$CC
-        [ "$HARNESS_EXT" = "cpp" ] && COMPILER=$CXX
+        [ "$EXT" = "cpp" ] && COMPILER=$CXX
         $COMPILER $CFLAGS $LIB_FUZZING_ENGINE \
-            "$FUZZING_DIR/${FUZZER}.${HARNESS_EXT}" \
-            -I"$SRC" \
+            "${FUZZER_SRCS[$FUZZER]}" \
+            -I"$PROJECT_ROOT" \
             -o "$PKG_DIR/$FUZZER" \
             __LINK_FLAGS__         # ← e.g. "$LIB_BUILD/libfoo.a"
         echo "  OK: $FUZZER"
     done
 
     echo "=== Creating seed corpus zips ==="
-    for FUZZER in "${FUZZERS[@]}"; do
+    for FUZZER in "${!FUZZER_SRCS[@]}"; do
         SEED_DIR="${SEED_DIRS[$FUZZER]:-}"
         if [ -n "$SEED_DIR" ] && [ -d "$SEED_DIR" ] && [ -n "$(ls -A "$SEED_DIR" 2>/dev/null)" ]; then
             find "$SEED_DIR" -maxdepth 1 -type f | \
                 xargs zip -j "$PKG_DIR/${FUZZER}_seed_corpus.zip" > /dev/null
-            echo "  OK: ${FUZZER}_seed_corpus.zip"
+            echo "  OK: ${FUZZER}_seed_corpus.zip (from $SEED_DIR)"
         else
             echo "  SKIP: no seeds for $FUZZER"
         fi
@@ -206,7 +254,7 @@ build_for_sanitizer() {
 
     echo "=== Copying dict and llvm-symbolizer ==="
     if [ -n "$DICT_FILE" ] && [ -f "$DICT_FILE" ]; then
-        for FUZZER in "${FUZZERS[@]}"; do
+        for FUZZER in "${!FUZZER_SRCS[@]}"; do
             cp "$DICT_FILE" "$PKG_DIR/${FUZZER}.dict"
         done
         echo "  Copied dict for all fuzzers"
@@ -241,7 +289,8 @@ if [ "$SANITIZER" = "address" ]; then
 else
     PREBUILT="$PROJECT_ROOT/build_harness/msan"
 fi
-# Then in the harness compile loop, add -I"$PREBUILT/include" and link "$PREBUILT/lib<name>.a"
+# In the harness compile loop, use -I"$PREBUILT/include" and link "$PREBUILT/lib<name>.a"
+# The loop already iterates over FUZZER_SRCS (auto-discovered), so all harnesses are covered.
 ```
 
 ### Build library commands per build system
